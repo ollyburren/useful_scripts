@@ -1,56 +1,153 @@
 use strict;
 use File::Basename;
+use Config::IniFiles;
+use Getopt::Long;
 
-#depends on the template (zero based).
-my @MET_POSITION=(0,35,54,63,71,75,81,84,94,102,143,148);
-#insert size
-my $ISIZE=151;
-# quality score cutoff
-my $QSCORE_CUTOFF=20;
-my %BIN=(
-	cutadapt=>"$ENV{HOME}/.local/bin/cutadapt",
-	flash=>"$ENV{HOME}/src/FLASH-1.2.7/flash"
-);
-my %CADAPT_PARAM=(
-	left=>{
-		a=>['ATCTCGTATGCCGTCTTCTGCTTG','AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC'],
-		q=> 20,
-		O=>6
-	},
-	right=>{
-		a=>['AGATCTCGGTGGTCGCCGTATCATT','AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT'],
-		q=> 20,
-		O=>6
-	},
-	foxp3_left=>{
-		g=>'TATAGATTATGTTTTTATAT',
-		m=>171
-	},
-	foxp3_right=>{
-		a=>'GAATTGGTTGTTTTGTTTTGTAGTAG'
-	}
-);
+my $USAGE=<<EOL;
+$0: Count methylation sites in a set of paired end reads.
+This software given a set set of paired end FASTQ formatted files will attempt
+to QC and call methylation status at a series of bases based on parameters defined
+in the given ini file.
 
+$0 --base_dir analysis_path --f1 forward.fq.gz -f2 reverse.fq.gz --ini inifile.ini --gene gene
 
+	MANDATORY PARAMETERS:
+		base_dir|b:	path to a location to store intermiediate and final analysis files
+		f1:	path to forward set of reads in gzipped fastq format
+		f2: path to reverse set of reads in gzipped fastq format
+		ini: path to ini file containing configuration options
+		gene|g: name of gene to analysed, there must be the [GENE], [GENE FOXP3_(left|right) 
+			sections defined in the ini file..
+			
+	OPTIONAL:
+		help|h: print this message.
+		
+	Original method Chris Penkett, Software Olly Burren.
+		
+Last updated 14/10/2013
+EOL
 
-##prepare directories
+####################
+#OPTIONS PROCESSING#
+####################
 
-my $BASE_DIR=shift | '/stats/oliver/BISSEQ/test/';
-my $FQ1=shift || '/dunwich/scratch/olly/DRAINBOW/bis_test/fastq/B790001_P3_D2.1.fq.gz';
-my $FQ2=shift || '/dunwich/scratch/olly/DRAINBOW/bis_test/fastq/B790001_P3_D2.2.fq.gz';;
+##MONDAY CONVERT TO USING GETOPTS THEN ADD CD3 PARAMETERS TO INI FILE.
 
-if(!$BASE_DIR || !-e $FQ1 || !-e $FQ2){
-	print "Incorrect parameters\n";
-	exit;
+my ($base_dir,$fq1,$fq2,$gene,$ini,$help);
+
+GetOptions(	
+	"base_dir|b=s" => \$base_dir,
+	"f1=s" => \$fq1,
+	"f2=s" => \$fq2,
+	"gene|g=s"=>\$gene,
+	"ini=s"=>\$ini,
+	"help|h"=>\$help);
+
+my $ABORT_FLAG=0;
+if(!$base_dir){
+	print "[ERROR] Require --base_dir/-b option: Location for analysis files to be written\n";
+	$ABORT_FLAG++;
+}elsif(!$fq1){
+	print "[ERROR] Require --f1 option: Path to fastaq file with forward PE reads to be analysed\n";
+	$ABORT_FLAG++;
+}elsif(!$fq2){
+	print "[ERROR] Require --f2 option: Path to fastaq file with reverse PE reads to be analysed\n";
+	$ABORT_FLAG++;
+}elsif(!$ini){
+	print "[ERROR] Require --ini option: Path to ini\n";
+	$ABORT_FLAG++;
+}elsif(!$gene){
+	print "[ERROR] Require gene\n";
+	$ABORT_FLAG++;
 }
 
-if(! -e $BASE_DIR){
-	mkdir($BASE_DIR);
+exit(1) if $ABORT_FLAG;
+
+if(! -e $ini){
+	print "[ERROR] Cannot find $ini ini file\n";
+	$ABORT_FLAG++;
+}elsif(! -e $fq1){
+	print "[ERROR] Cannot find $fq1 forward FASTAQ file\n";
+	$ABORT_FLAG++;
+}elsif(! -e $fq2){
+	print "[ERROR] Cannot find $fq2 reverse FASTAQ file\n";
+	$ABORT_FLAG++;
+}
+
+
+
+my $cfg = new Config::IniFiles( -file => $ini);
+
+#check that sections for gene given exist
+
+if(!$cfg->SectionExists($gene) || 
+		!$cfg->SectionExists("CUTADAPT ${gene}_left") || 
+		!$cfg->SectionExists("CUTADAPT ${gene}_right")){
+	print "[ERROR] Cannot find all conf sections for $gene\n";
+	print "[ERROR] Expecting [$gene],[CUTADAPT ${gene}_left] and [CUTADAPT ${gene}_right]\n";
+	$ABORT_FLAG++;
+}
+
+exit(1) if $ABORT_FLAG;
+
+#################################
+##PARSE IN SETTING FROM CFG FILE#
+#################################
+
+##BINARIES
+
+my %BIN=(
+	cutadapt=>$cfg->val('GENERAL','cutadapt_bin'),
+	flash=>$cfg->val('GENERAL','flash_bin')
+);
+
+# quality score cutoff
+my $QSCORE_CUTOFF=$cfg->val('GENERAL','qscore_cutoff');
+
+# methylation positions
+my @MET_POSITION=split(",",$cfg->val($gene,'met_pos'));
+	
+#insert size
+my $ISIZE=$cfg->val($gene,'insert_size');
+
+#cutadapt parameters
+my %CADAPT_PARAM=(
+	left=>{
+		a=>$cfg->val('CUTADAPT ilmn_left','a'),
+		q=> $cfg->val('CUTADAPT ilmn_left','q'),
+		O=>$cfg->val('CUTADAPT ilmn_left','O')
+	},
+	right=>{
+		a=>$cfg->val('CUTADAPT ilmn_right','a'),
+		q=> $cfg->val('CUTADAPT ilmn_right','q'),
+		O=>$cfg->val('CUTADAPT ilmn_right','O')
+	},
+	foxp3_left=>{
+		g=>$cfg->val("CUTADAPT ${gene}_left",'g'),
+		m=>$cfg->val("CUTADAPT ${gene}_left",'m')
+	},
+	foxp3_right=>{
+		a=>$cfg->val("CUTADAPT ${gene}_right",'a'),
+	}
+);
+
+
+###############################
+##PREPARE ANALYSIS DIRECTORIES#
+###############################
+
+
+if(! -e $base_dir){
+	mkdir($base_dir);
+}
+$base_dir.='/'.$gene;
+if(! -e $base_dir){
+	mkdir($base_dir);
 	for my $d(qw/remove_il_adaptor manual_trim stitch final_trim results/){
-		mkdir($BASE_DIR.'/'.$d);
+		mkdir($base_dir.'/'.$d);
 	}
 }else{
-	print "$BASE_DIR already exists aborting\n";
+	print "$base_dir already exists overwriting\n";
 }
 
 
@@ -71,13 +168,13 @@ foreach my $lr(keys %CADAPT_PARAM){
 ##################################
 
 ##trim LH side ill
-my $lhfile="$BASE_DIR/remove_il_adaptor/".basename($FQ1,'.fq.gz');
-my $cmd =  $CADAPT_PARAM{left}{cmd}." $FQ1 2> $lhfile.cut.stats.out | gzip - > $lhfile.trimmed.fq.gz"; 
+my $lhfile="$base_dir/remove_il_adaptor/".basename($fq1,'.fq.gz');
+my $cmd =  $CADAPT_PARAM{left}{cmd}." $fq1 2> $lhfile.cut.stats.out | gzip - > $lhfile.trimmed.fq.gz"; 
 print $cmd."\n";
 `$cmd`;
 ##trim RH side ill
-my $rhfile="$BASE_DIR/remove_il_adaptor/".basename($FQ2,'.fq.gz');
-$cmd =  $CADAPT_PARAM{right}{cmd}." $FQ2 2> $lhfile.cut.stats.out | gzip - > $rhfile.trimmed.fq.gz"; 
+my $rhfile="$base_dir/remove_il_adaptor/".basename($fq2,'.fq.gz');
+$cmd =  $CADAPT_PARAM{right}{cmd}." $fq2 2> $lhfile.cut.stats.out | gzip - > $rhfile.trimmed.fq.gz"; 
 print $cmd."\n";
 `$cmd`;
 
@@ -86,7 +183,7 @@ print $cmd."\n";
 #########################
 
 my $sfile = basename($lhfile,'.1');
-$cmd="$BIN{flash} $lhfile.trimmed.fq.gz $rhfile.trimmed.fq.gz -z -o $sfile -d $BASE_DIR/stitch/ >$BASE_DIR/stitch/$sfile.stats.txt"; 
+$cmd="$BIN{flash} $lhfile.trimmed.fq.gz $rhfile.trimmed.fq.gz -z -o $sfile -d $base_dir/stitch/ >$base_dir/stitch/$sfile.stats.txt"; 
 print "$cmd\n";
 `$cmd`;
 
@@ -94,8 +191,8 @@ print "$cmd\n";
 ##TRIM UP TO FIRST METH SITE#
 #############################
 
-my $ltfile = "$BASE_DIR/final_trim/$sfile.LTRIM";
-my $cmd =  $CADAPT_PARAM{foxp3_left}{cmd}." $BASE_DIR/stitch/$sfile.extendedFrags.fastq.gz 2>$ltfile.cut.stats.out | gzip - > $ltfile.fq.gz";
+my $ltfile = "$base_dir/final_trim/$sfile.LTRIM";
+my $cmd =  $CADAPT_PARAM{foxp3_left}{cmd}." $base_dir/stitch/$sfile.extendedFrags.fastq.gz 2>$ltfile.cut.stats.out | gzip - > $ltfile.fq.gz";
 print "$cmd\n";
 `$cmd`;
 
@@ -103,7 +200,7 @@ print "$cmd\n";
 ##TRIM REMAINING ADAPTOR 5' #
 #############################
 
-my $rtfile = "$BASE_DIR/final_trim/$sfile.LRTRIM";
+my $rtfile = "$base_dir/final_trim/$sfile.LRTRIM";
 my $cmd =  $CADAPT_PARAM{foxp3_right}{cmd}." $ltfile.fq.gz 2>$rtfile.cut.stats.out | gzip - > $rtfile.fq.gz";
 print "$cmd\n";
 `$cmd`;
@@ -113,7 +210,7 @@ print "$cmd\n";
 ###########################
 
 open(IN,"gunzip -c $rtfile.fq.gz |") || die "Cannot open $rtfile.fq.gz\n";
-open(OUT,"> $BASE_DIR/results/$sfile.out") || die "Cannot open $BASE_DIR/results/$sfile.out\n";
+open(OUT,"> $base_dir/results/$sfile.out") || die "Cannot open $base_dir/results/$sfile.out\n";
 
 my %res;
 my @len;
