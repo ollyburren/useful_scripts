@@ -1,0 +1,112 @@
+---
+title: Examine Evidence for deviation from Hardy-Weinberg Equilibrium for 
+  rs45443101
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+Code to compute deviance from Hardy-Weinberg equilibrium from a vcf file. Contains routines to query vcf file using bcftools and return specific individuals if required. The deviance is worked out manually  in order to illustrate the underlying principles.
+
+Mathemetical property of alleles (Aa) in a large population assuming random assortment $(a + A)^2 = A^2 + 2aA + a^2 = 1$ without the influence of external influences such as mate choice, mutation, selection, genetic drift, gene flow and meitotic drive. using $\chi^2 = \sum \frac{(O-E)^2}{E}$ we can test for deviance.
+
+
+```{r, echo=FALSE,warning=FALSE,message=FALSE}
+library(data.table)
+library(GenomicRanges)
+library(snpStats)
+bcftools_bin<-'/usr/local/bin/bcftools'
+
+
+robustDTfread<-function(cmd){
+        tryCatch(as.data.frame(fread(cmd,sep="\t",header=FALSE,stringsAsFactors=FALSE)),error=function(e){print(sprintf("Error=%s fread CMD=%s",e,cmd));return(NA)})
+}
+
+## region 1:12345-45678
+## vcf.dir location of vcf files
+## fname filename pattern for which we can substitute chromosome
+## 
+
+getVCFHeader<-function(vf,...){
+    ARGS<-list(...)
+    if('individuals' %in% ARGS){
+        ind<-paste(individuals,sep=',',collapse=',')
+        header_cmd<-sprintf("%s view -s %s --header-only %s",bcftools_bin,ind,vf)
+    }else{
+        header_cmd<-sprintf("%s view --header-only %s",bcftools_bin,vf)
+    }
+    my.pipe<-pipe(header_cmd)
+    header<-tail(scan(my.pipe,what=character(),sep="\n",quiet=TRUE),n=1)
+    close(my.pipe)
+    d<-"\t"
+    if('delim' %in% ARGS)
+        d<-ARGS[['delim']]
+    unlist(strsplit(header,d))
+}
+
+getVCFBody<-function(vf,region,...){
+    ARGS<-list(...)
+    if('individuals' %in% ARGS){
+        ind<-paste(individuals,sep=',',collapse=',')
+        body_cmd<-sprintf("%s view %s -r %s -s %s -Ov -H",bcftools_bin,vf,region,ind)
+    }else{
+        body_cmd<-sprintf("%s view %s -r %s -Ov -H",bcftools_bin,vf,region)
+    }
+    tmp<-robustDTfread(body_cmd)
+    if(any(is.na(tmp)))
+        return(NA)
+    tmp
+}
+
+getSNP<-function(region,vcf.dir,fname,...){
+    ARGS<-list(...)
+    ## parse region
+    chr<-sub("([^:]+):.*","\\1",region)
+    start<-as.numeric(sub("[^:]+:([^\\-]+)\\-.*","\\1",region))
+    end<-as.numeric(sub("[^:]+:[^\\-]+\\-(.*)","\\1",region))
+    vf<-file.path(vcf.dir,sprintf(fname,chr))
+    # get header
+    if('individuals' %in% ARGS){
+        cn<-getVCFHeader(vf,individuals=ARGS[['individuals']])
+        bd<-getVCFBody(vf,region,individuals=ARGS[['individuals']])
+    }else{
+        cn<-getVCFHeader(vf)
+        bd<-getVCFBody(vf,region)
+    }
+    setnames(bd,cn)
+    bd
+}
+
+
+```
+
+Retrieve genotypes for whole cohort for  and compute 
+
+```{r get_genotypes, echo=TRUE}
+## note this is local and mounted by sshfs hpc:/scratch/WGS10K/ /Users/oliver/hpc
+## get genotypes from merged VCF file.
+vcf.dir<-'/Users/oliver/hpc/data/release/latest/merged-vcf/no_hgmd/gnomad'
+test.snp<-'rs45443101'
+snp.region<-'16:81922781-81922781'
+fname<-'chr%s_agg3_dedup_vep_gnomad.bcf'
+snp<-getSNP(snp.region,vcf.dir,fname)
+gt<-snp[,10:ncol(snp)]
+## extract alleles
+alleles<-sapply(strsplit(t(gt)[,1],":",fixed=TRUE),'[[',1)
+## compute observed allele freq
+AA<-sum(alleles=="0/0")
+Aa<-sum(alleles=="0/1")
+aa<-sum(alleles=="1/1")
+## compute A(p) and a(q) allele frequencies
+p<-((2*AA) + Aa)/(2*(AA+Aa+aa))
+q<-1-p
+## compute expected allele freq
+eAA<-p^2*length(alleles)
+eAa<-2*p*q*length(alleles)
+eaa<-q^2*length(alleles)
+## compute chi.sq statistic with 1 degree of freedom
+v<-cbind(c(AA,Aa,aa),c(eAA,eAa,eaa))
+chi.sq<-sum((v[,1]-v[,2])^2/v[,2])
+p.val<-pchisq(chi.sq,df=1,lower.tail = FALSE)
+```
+In the case of `r I(test.snp)` we have a $\chi^2$ of `r I(signif(chi.sq,digits=2))` this translates to a $P$ of `r I(signif(p.val,digits=2))` and we accept $H_{0}$ that it does not deviate from expected HWE in this cohort of `r length(alleles)` individuals.
